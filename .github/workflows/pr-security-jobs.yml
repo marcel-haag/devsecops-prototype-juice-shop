@@ -1,0 +1,53 @@
+name: "PR Security Jobs"
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_DEFAULT_VERSION: 22
+  NODE_OPTIONS: "--max_old_space_size=4096"
+
+jobs:
+  build:
+    name: "Build application(s)"
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Use Node.js ${{ env.NODE_DEFAULT_VERSION }}"
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af #v4.1.0
+        with:
+          node-version: ${{ env.NODE_DEFAULT_VERSION }}
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts
+
+      - name: "Install frontend dependencies and build"
+        run: |
+          cd frontend
+          npm install --ignore-scripts
+          npm run build
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts
+  #secret-scanning:
+  #sast:
+  #sca:
+  #container-scanning:
+  #sast:
