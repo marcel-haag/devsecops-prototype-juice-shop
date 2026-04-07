@@ -1,0 +1,690 @@
+name: "PR Security Jobs"
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_DEFAULT_VERSION: 22
+  NODE_OPTIONS: "--max_old_space_size=4096"
+  REPORTS_DIR: reports
+  DOCKER_IMAGE_NAME: juice-shop
+  # Stop / Start Artifact upload in all jobs (set to "true" to enable)
+  UPLOAD_ARTIFACTS: "true" # if: env.UPLOAD_ARTIFACTS == 'true'
+
+jobs:
+  pr-context:
+    name: "Prepare PR context"
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    outputs:
+      base_sha: ${{ steps.ctx.outputs.base_sha }}
+      head_sha: ${{ steps.ctx.outputs.head_sha }}
+      deps_changed: ${{ steps.ctx.outputs.deps_changed }}
+      docker_changed: ${{ steps.ctx.outputs.docker_changed }}
+      iac_changed: ${{ steps.ctx.outputs.iac_changed }}
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: "Determine changed files"
+        id: ctx
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+          git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | tee changed-files.txt
+
+          if grep -Eq '^(package\.json|package-lock\.json|frontend/package\.json|frontend/package-lock\.json)$' changed-files.txt; then
+            echo "deps_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deps_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if grep -Eq '^(Dockerfile|Dockerfile\..*|.*\.Dockerfile|\.dockerignore|docker-compose.*\.ya?ml|VulnerableDockerfile)$' changed-files.txt; then
+            echo "docker_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if grep -Eq '^(Dockerfile|Dockerfile\..*|.*\.Dockerfile|docker-compose.*\.ya?ml|.*\.tf|.*\.tfvars|helm/.*|k8s/.*|manifests/.*)$' changed-files.txt; then
+            echo "iac_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "iac_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Upload changed files list"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: pr-changed-files
+          path: changed-files.txt
+          if-no-files-found: error
+
+  build:
+    name: "Build application(s)"
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    outputs:
+      backend_lockfile_exists: ${{ steps.detect.outputs.backend_lockfile_exists }}
+      frontend_lockfile_exists: ${{ steps.detect.outputs.frontend_lockfile_exists }}
+      docker_image_tag: ${{ steps.meta.outputs.docker_image_tag }}
+      docker_image_tar: ${{ steps.meta.outputs.docker_image_tar }}
+
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Use Node.js ${{ env.NODE_DEFAULT_VERSION }}"
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af #v4.1.0
+        with:
+          node-version: ${{ env.NODE_DEFAULT_VERSION }}
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts
+
+      - name: "Install frontend dependencies and build"
+        run: |
+          cd frontend
+          npm install --ignore-scripts --package-lock=true
+          npm run build
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts --package-lock=true
+
+      - name: "Debug frontend install output"
+        run: |
+          cd frontend
+          pwd
+          ls -la
+          ls -la package.json || true
+          ls -la package-lock.json || true
+          npm config get package-lock
+
+      - name: "Debug backend install output"
+        run: |
+          pwd
+          ls -la
+          ls -la package.json || true
+          ls -la package-lock.json || true
+          npm config get package-lock
+
+      - name: "Detect generated lockfiles"
+        id: detect
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "backend_lockfile_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend_lockfile_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f frontend/package-lock.json ]; then
+            echo "frontend_lockfile_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend_lockfile_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Upload lockfiles artifact"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        # if: steps.detect.outputs.backend_lockfile_exists == 'true' || steps.detect.outputs.frontend_lockfile_exists == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: npm-lockfiles
+          path: |
+            package-lock.json
+            frontend/package-lock.json
+          if-no-files-found: warn
+
+      - name: "Set Docker image metadata"
+        id: meta
+        run: |
+          echo "docker_image_tag=${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "docker_image_tar=juice-shop-image.tar" >> "$GITHUB_OUTPUT"
+
+      - name: "Build container image"
+        run: |
+          docker build -t "${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" .
+
+      - name: "Save container image as tar"
+        run: |
+          docker save "${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" -o juice-shop-image.tar
+
+      - name: "Upload container image artifact"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: built-docker-image
+          path: juice-shop-image.tar
+          if-no-files-found: error
+  
+  secret-scanning:
+    name: "Secret scanning (Gitleaks)"
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs:
+      - pr-context
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/gitleaks"
+
+      - name: "Download and install Gitleaks"
+        run: |
+          GITLEAKS_VERSION="8.24.2"
+          curl -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: "Run Gitleaks on PR commit range"
+        run: |
+          set +e
+          RANGE="${{ needs.pr-context.outputs.base_sha }}..${{ needs.pr-context.outputs.head_sha }}"
+
+          gitleaks git . \
+            --log-opts="${RANGE}" \
+            --report-format json \
+            --report-path "${REPORTS_DIR}/gitleaks/gitleaks-report.json"
+          EXIT_CODE=$?
+
+          gitleaks git . \
+            --log-opts="${RANGE}" \
+            --report-format sarif \
+            --report-path "${REPORTS_DIR}/gitleaks/gitleaks-report.sarif" || true
+
+          echo "${EXIT_CODE}" > "${REPORTS_DIR}/gitleaks/gitleaks-exit-code.txt"
+          exit 0
+
+      - name: "Install jq"
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: "Create PR comment body"
+        run: |
+          COUNT="$(jq 'length' "${REPORTS_DIR}/gitleaks/gitleaks-report.json" 2>/dev/null || echo 0)"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            {
+              echo "<!-- security-job:gitleaks -->"
+              echo "## Secret scanning (Gitleaks)"
+              echo
+              echo "Job found no violations in PR commits."
+            } > comment.md
+          else
+            TOP="$(jq -r '.[0:5][] | "- `\(.RuleID // "secret")` in `\(.File // "unknown")`"' "${REPORTS_DIR}/gitleaks/gitleaks-report.json")"
+
+            {
+              echo "<!-- security-job:gitleaks -->"
+              echo "## Secret scanning (Gitleaks)"
+              echo
+              echo "Found **${COUNT}** potential secret finding(s) in PR commits."
+              echo
+              echo "${TOP}"
+            } > comment.md
+          fi
+
+      - name: "Upsert PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_KEY: gitleaks
+        run: |
+          MARKER="<!-- security-job:${JOB_KEY} -->"
+          COMMENT_ID="$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --paginate \
+            -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" | tail -n1)"
+          if [ -n "${COMMENT_ID}" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
+              --method PATCH \
+              -f body="$(cat comment.md)"
+          else
+            gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+              -f body="$(cat comment.md)"
+          fi
+
+  sast:
+    name: "SAST (Semgrep diff-aware)"
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    needs: pr-context
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/semgrep"
+
+      - name: "Export baseline commit from PR context"
+        run: |
+          echo "SEMGREP_BASELINE_COMMIT=${{ needs.pr-context.outputs.base_sha }}" >> "${GITHUB_ENV}"
+          echo "Using baseline: ${{ needs.pr-context.outputs.base_sha }}"
+
+      - name: "Run Semgrep diff-aware scan via Docker"
+        run: |
+          set +e
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --baseline-commit "${SEMGREP_BASELINE_COMMIT}" \
+              --error \
+              --json \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.json"
+          EXIT_CODE=$?
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --baseline-commit "${SEMGREP_BASELINE_COMMIT}" \
+              --sarif \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.sarif" || true
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --baseline-commit "${SEMGREP_BASELINE_COMMIT}" \
+              --text \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.txt" || true
+
+          echo "${EXIT_CODE}" > "${REPORTS_DIR}/semgrep/semgrep-exit-code.txt"
+          exit 0
+
+      - name: "Install jq"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: "Create PR comment body"
+        run: |
+          REPORT_FILE="${REPORTS_DIR}/semgrep/semgrep-report.json"
+
+          if [ ! -f "${REPORT_FILE}" ]; then
+            cat > pr-comment.md <<'EOF'
+          ## Semgrep SAST results
+
+          No Semgrep JSON report was found.
+          Please check the workflow logs.
+          EOF
+            exit 0
+          fi
+
+          FINDING_COUNT="$(jq '.results | length' "${REPORT_FILE}")"
+
+          if [ "${FINDING_COUNT}" -eq 0 ]; then
+            cat > pr-comment.md <<'EOF'
+          ## Semgrep SAST results
+
+          Nothing found in the PR changes.
+          EOF
+          else
+            TOP_FINDINGS="$(jq -r '.results[:5][] | "- `\(.check_id)` in `\(.path)` [severity: \(.extra.severity // "unknown")]"' "${REPORT_FILE}")"
+
+            cat > pr-comment.md <<EOF
+          ## Semgrep SAST results
+
+          Found **${FINDING_COUNT}** finding(s) in the PR changes.
+
+          First findings:
+          ${TOP_FINDINGS}
+
+          Please review the workflow logs and uploaded artifacts for full details.
+          EOF
+          fi
+
+      - name: "Post PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="$(cat pr-comment.md)"
+
+      - name: "Fail on Semgrep findings"
+        # keep semgrep PR scan non-blocking while preserving PR comments
+        run: |
+          EXIT_CODE="$(cat "${REPORTS_DIR}/semgrep/semgrep-exit-code.txt")"
+          if [ "${EXIT_CODE}" -ne 0 ]; then
+            echo "Semgrep found findings, but the job stays successful for prototype/testing."
+            # exit "${EXIT_CODE}"
+          fi
+          exit 0
+
+  sca:
+    name: "SCA (OWASP Dependency-Check)"
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs:
+      - pr-context
+    env:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
+      OSS_INDEX_TOKEN: ${{ secrets.OSS_INDEX_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: "Use Node.js ${{ env.NODE_DEFAULT_VERSION }}"
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: ${{ env.NODE_DEFAULT_VERSION }}
+
+      - name: "Install jq"
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: "Prepare base and head snapshots"
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ needs.pr-context.outputs.base_sha }}"
+          HEAD_SHA="${{ needs.pr-context.outputs.head_sha }}"
+
+          mkdir -p /tmp/sca-base
+          mkdir -p /tmp/sca-head
+
+          git archive "${BASE_SHA}" | tar -x -C /tmp/sca-base
+          git archive "${HEAD_SHA}" | tar -x -C /tmp/sca-head
+
+      - name: "Generate lockfiles for head snapshot"
+        run: |
+          set -euo pipefail
+
+          cd /tmp/sca-head
+          npm install --ignore-scripts --package-lock=true
+
+          if [ -f frontend/package.json ]; then
+            (
+              cd frontend
+              npm install --ignore-scripts --package-lock=true
+            )
+          fi
+
+      - name: "Generate lockfiles for base snapshot"
+        run: |
+          set -euo pipefail
+
+          cd /tmp/sca-base
+          npm install --ignore-scripts --package-lock=true
+
+          if [ -f frontend/package.json ]; then
+            (
+              cd frontend
+              npm install --ignore-scripts --package-lock=true
+            )
+          fi
+
+      - name: "Prepare writable directories"
+        run: |
+          mkdir -p reports/dependency-check-base
+          mkdir -p reports/dependency-check-head
+          mkdir -p /tmp/dc-data
+          chmod -R 777 reports /tmp/dc-data
+
+      - name: "Run Dependency-Check on base snapshot"
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "/tmp/sca-base:/src" \
+            -v "${GITHUB_WORKSPACE}/reports/dependency-check-base:/report" \
+            -v "/tmp/dc-data:/usr/share/dependency-check/data" \
+            owasp/dependency-check:latest \
+            --project "devsecops-prototype-juice-shop-base" \
+            --scan /src/package-lock.json \
+            --scan /src/frontend/package-lock.json \
+            --format "JSON" \
+            --out /report \
+            --nvdApiKey "${NVD_API_KEY}" \
+            --ossIndexUsername "${OSS_INDEX_USERNAME}" \
+            --ossIndexPassword "${OSS_INDEX_TOKEN}" \
+            --prettyPrint || true
+
+      - name: "Run Dependency-Check on head snapshot"
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "/tmp/sca-head:/src" \
+            -v "${GITHUB_WORKSPACE}/reports/dependency-check-head:/report" \
+            -v "/tmp/dc-data:/usr/share/dependency-check/data" \
+            owasp/dependency-check:latest \
+            --project "devsecops-prototype-juice-shop-head" \
+            --scan /src/package-lock.json \
+            --scan /src/frontend/package-lock.json \
+            --format "JSON" \
+            --out /report \
+            --nvdApiKey "${NVD_API_KEY}" \
+            --ossIndexUsername "${OSS_INDEX_USERNAME}" \
+            --ossIndexPassword "${OSS_INDEX_TOKEN}" \
+            --prettyPrint || true
+
+      - name: "Create diff of newly introduced vulnerabilities"
+        run: |
+          BASE_REPORT="reports/dependency-check-base/dependency-check-report.json"
+          HEAD_REPORT="reports/dependency-check-head/dependency-check-report.json"
+
+          if [ ! -f "${BASE_REPORT}" ]; then
+            echo "[]" > "${BASE_REPORT}"
+          fi
+
+          if [ ! -f "${HEAD_REPORT}" ]; then
+            echo "[]" > "${HEAD_REPORT}"
+          fi
+
+          jq -r '
+            .dependencies[]? as $dep
+            | ($dep.fileName // $dep.packagePath // $dep.filePath // "unknown") as $pkg
+            | $dep.vulnerabilities[]?
+            | [
+                $pkg,
+                (.name // .source // "unknown"),
+                (.severity // "UNKNOWN"),
+                (.description // .name // "unknown")
+              ]
+            | @tsv
+          ' "${BASE_REPORT}" | sort -u > base-findings.tsv
+
+          jq -r '
+            .dependencies[]? as $dep
+            | ($dep.fileName // $dep.packagePath // $dep.filePath // "unknown") as $pkg
+            | $dep.vulnerabilities[]?
+            | [
+                $pkg,
+                (.name // .source // "unknown"),
+                (.severity // "UNKNOWN"),
+                (.description // .name // "unknown")
+              ]
+            | @tsv
+          ' "${HEAD_REPORT}" | sort -u > head-findings.tsv
+
+          comm -13 base-findings.tsv head-findings.tsv > new-findings.tsv || true
+
+          wc -l new-findings.tsv
+          cat new-findings.tsv || true
+
+      - name: "Create PR comment body"
+        run: |
+          COUNT="$(awk 'NF' new-findings.tsv | wc -l | tr -d ' ')"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            {
+              echo "<!-- security-job:sca -->"
+              echo "## SCA (Dependency-Check PR diff)"
+              echo
+              echo "Job found no newly introduced dependency vulnerabilities in this PR."
+            } > comment.md
+          else
+            TOP="$(head -n 10 new-findings.tsv | awk -F '\t' '{print "- `"$1"` — `"$2"` ["$3"]"}')"
+
+            {
+              echo "<!-- security-job:sca -->"
+              echo "## SCA (Dependency-Check PR diff)"
+              echo
+              echo "Found **${COUNT}** dependency vulnerability finding(s) newly introduced by this PR."
+              echo
+              echo "${TOP}"
+            } > comment.md
+          fi
+
+      - name: "Upsert PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_KEY: sca
+        run: |
+          MARKER="<!-- security-job:${JOB_KEY} -->"
+          COMMENT_ID="$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --paginate \
+            -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" | tail -n1)"
+          if [ -n "${COMMENT_ID}" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
+              --method PATCH \
+              -f body="$(cat comment.md)"
+          else
+            gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+              -f body="$(cat comment.md)"
+          fi
+
+  iac-scanning:
+    name: "IaC scanning (Trivy)"
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs:
+      - pr-context
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: "Install Trivy"
+        if: needs.pr-context.outputs.iac_changed == 'true'
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sh -s -- -b /usr/local/bin v0.69.3
+          trivy --version
+
+      - name: "Create reports directory"
+        if: needs.pr-context.outputs.iac_changed == 'true'
+        run: mkdir -p "${REPORTS_DIR}/trivy-iac"
+
+      - name: "Build changed IaC file list"
+        if: needs.pr-context.outputs.iac_changed == 'true'
+        run: |
+          git diff --name-only "${{ needs.pr-context.outputs.base_sha }}" "${{ needs.pr-context.outputs.head_sha }}" \
+            | grep -E '^(Dockerfile|Dockerfile\..*|.*\.Dockerfile|docker-compose.*\.ya?ml|.*\.tf|.*\.tfvars|helm/.*|k8s/.*|manifests/.*)$' \
+            > changed-iac-files.txt || true
+
+          cat changed-iac-files.txt || true
+
+      - name: "Run Trivy config scan on changed IaC files"
+        if: needs.pr-context.outputs.iac_changed == 'true'
+        run: |
+          set +e
+          xargs -r trivy config --format json --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.json" < changed-iac-files.txt
+          EXIT_CODE=$?
+          echo "${EXIT_CODE}" > "${REPORTS_DIR}/trivy-iac/trivy-iac-exit-code.txt"
+          exit 0
+
+      - name: "Install jq"
+        if: needs.pr-context.outputs.iac_changed == 'true'
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: "Create PR comment body"
+        run: |
+          REPORT_FILE="${REPORTS_DIR}/trivy-iac/trivy-iac-report.json"
+
+          if [ "${{ needs.pr-context.outputs.iac_changed }}" != "true" ]; then
+            {
+              echo "<!-- security-job:iac -->"
+              echo "## IaC scanning (Trivy)"
+              echo
+              echo "Job found no violations because no IaC-relevant files changed in this PR."
+            } > comment.md
+            exit 0
+          fi
+
+          if [ ! -f "${REPORT_FILE}" ]; then
+            {
+              echo "<!-- security-job:iac -->"
+              echo "## IaC scanning (Trivy)"
+              echo
+              echo "No Trivy IaC JSON report was found."
+            } > comment.md
+            exit 0
+          fi
+
+          COUNT="$(jq '[.Results[]?.Misconfigurations[]?] | length' "${REPORT_FILE}" 2>/dev/null || echo 0)"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            {
+              echo "<!-- security-job:iac -->"
+              echo "## IaC scanning (Trivy)"
+              echo
+              echo "Job found no violations in changed IaC files."
+            } > comment.md
+          else
+            TOP="$(jq -r '[.Results[]?.Misconfigurations[]?][0:10][] | "- `\(.ID)` — \(.Title) [\(.Severity)]"' "${REPORT_FILE}")"
+
+            {
+              echo "<!-- security-job:iac -->"
+              echo "## IaC scanning (Trivy)"
+              echo
+              echo "Found **${COUNT}** misconfiguration finding(s) in changed IaC files."
+              echo
+              echo "${TOP}"
+            } > comment.md
+          fi
+
+      - name: "Upsert PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_KEY: iac
+        run: |
+          MARKER="<!-- security-job:${JOB_KEY} -->"
+          COMMENT_ID="$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --paginate \
+            -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" | tail -n1)"
+          if [ -n "${COMMENT_ID}" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
+              --method PATCH \
+              -f body="$(cat comment.md)"
+          else
+            gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+              -f body="$(cat comment.md)"
+          fi
