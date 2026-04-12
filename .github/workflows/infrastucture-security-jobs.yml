@@ -1,0 +1,245 @@
+# Unusable without self-hosted runner with OpenVAS installed and configured. For reference only.
+name: "Infrastructure Security Job (OpenVAS)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_host:
+        description: "Authorized target host or IP for OpenVAS scan"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REPORTS_DIR: reports
+  UPLOAD_ARTIFACTS: "true"
+  TARGET_URL: "https://preview.owasp-juice.shop"
+
+jobs:
+  infra-scanning-openvas:
+    name: "Infrastructure Scanning - OpenVAS"
+    # runs-on: self-hosted
+    runs-on: ubuntu-latest
+    # timeout-minutes: 180
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/openvas"
+
+      - name: "Store target metadata"
+        run: |
+          set -euo pipefail
+          {
+            echo "target=${{ inputs.target_host || env.TARGET_URL }}"
+            echo "trigger=${GITHUB_EVENT_NAME}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+          } > "${REPORTS_DIR}/openvas/scan-metadata.txt"
+
+      - name: "Write OpenVAS stack definition"
+        run: |
+          cat > docker-compose.openvas.yml <<'EOF'
+          services:
+            openvas:
+              image: immauss/openvas:latest
+              container_name: openvas
+              ports:
+                - "8080:9392"
+                - "9390:9390"
+              environment:
+                PASSWORD: admin
+                USERNAME: admin
+                RELAYHOST: ""
+              volumes:
+                - openvas-data:/data
+              restart: unless-stopped
+
+          volumes:
+            openvas-data:
+          EOF
+
+      - name: "Start OpenVAS"
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.openvas.yml up -d
+
+      - name: "Wait for OpenVAS web interface"
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            if curl -fsSI http://127.0.0.1:8080 >/dev/null; then
+              echo "OpenVAS web interface is reachable."
+              exit 0
+            fi
+            echo "Waiting for OpenVAS startup... ($i/120)"
+            sleep 15
+          done
+
+          echo "OpenVAS did not become ready in time."
+          docker logs openvas || true
+          exit 1
+
+      - name: "Wait for GMP service"
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            if nc -z 127.0.0.1 9390; then
+              echo "OpenVAS GMP service is reachable."
+              exit 0
+            fi
+            echo "Waiting for GMP service... ($i/120)"
+            sleep 15
+          done
+
+          echo "GMP service did not become ready in time."
+          docker logs openvas || true
+          exit 1
+
+      - name: "Install Python dependencies"
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install python-gvm lxml
+
+      - name: "Run OpenVAS scan"
+        env:
+          OPENVAS_USERNAME: admin
+          OPENVAS_PASSWORD: admin
+          OPENVAS_HOST: 127.0.0.1
+          OPENVAS_PORT: "9390"
+          TARGET_HOST: ${{ inputs.target_host || env.TARGET_URL }}
+        run: |
+          set -euo pipefail
+
+          cat > run_openvas_scan.py <<'PY'
+          import os
+          import time
+          from pathlib import Path
+          from gvm.connections import TLSConnection
+          from gvm.protocols.gmp import Gmp
+
+          username = os.environ["OPENVAS_USERNAME"]
+          password = os.environ["OPENVAS_PASSWORD"]
+          host = os.environ["OPENVAS_HOST"]
+          port = int(os.environ["OPENVAS_PORT"])
+          target_host = os.environ["TARGET_HOST"]
+
+          report_dir = Path("reports/openvas")
+          report_dir.mkdir(parents=True, exist_ok=True)
+
+          conn = TLSConnection(hostname=host, port=port, timeout=300)
+
+          with Gmp(conn) as gmp:
+              gmp.authenticate(username, password)
+
+              port_list_id = "33d0cd82-57c6-11e1-8ed1-406186ea4fc5"
+
+              target_response = gmp.create_target(
+                  name=f"authorized-target-{target_host}",
+                  hosts=[target_host],
+                  port_list_id=port_list_id
+              )
+              target_id = target_response.get("id")
+
+              configs = gmp.get_scan_configs()
+              full_and_fast_id = None
+              for cfg in configs.xpath("config"):
+                  if cfg.findtext("name") == "Full and fast":
+                      full_and_fast_id = cfg.get("id")
+                      break
+
+              if not full_and_fast_id:
+                  raise RuntimeError("Scan config 'Full and fast' not found.")
+
+              scanners = gmp.get_scanners()
+              scanner_id = None
+              for scanner in scanners.xpath("scanner"):
+                  if scanner.findtext("name"):
+                      scanner_id = scanner.get("id")
+                      break
+
+              if not scanner_id:
+                  raise RuntimeError("No scanner found.")
+
+              task_response = gmp.create_task(
+                  name=f"openvas-scan-{target_host}",
+                  config_id=full_and_fast_id,
+                  target_id=target_id,
+                  scanner_id=scanner_id
+              )
+              task_id = task_response.get("id")
+
+              start_response = gmp.start_task(task_id=task_id)
+              report_id = start_response.get("report_id")
+
+              summary_file = report_dir / "openvas-progress.txt"
+
+              while True:
+                  task_info = gmp.get_task(task_id=task_id)
+                  status = task_info.findtext(".//status")
+                  progress = task_info.findtext(".//progress")
+
+                  line = f"Status: {status}, progress: {progress}"
+                  print(line)
+                  with open(summary_file, "a", encoding="utf-8") as f:
+                      f.write(line + "\n")
+
+                  if status in ("Done", "Stopped", "Interrupted", "Delete Requested"):
+                      break
+
+                  time.sleep(30)
+
+              report_xml = gmp.get_report(
+                  report_id=report_id,
+                  details=True,
+                  ignore_pagination=True
+              )
+
+              with open(report_dir / "openvas-report.xml", "wb") as f:
+                  f.write(report_xml)
+
+              with open(report_dir / "openvas-summary.txt", "w", encoding="utf-8") as f:
+                  f.write(f"OpenVAS scan finished for target: {target_host}\n")
+          PY
+
+          python3 run_openvas_scan.py
+
+      - name: "Collect container logs"
+        if: always()
+        run: |
+          set -euo pipefail
+          docker logs openvas > "${REPORTS_DIR}/openvas/openvas-container.log" 2>&1 || true
+
+      - name: "Stop OpenVAS"
+        if: always()
+        run: |
+          docker compose -f docker-compose.openvas.yml down -v || true
+
+      - name: "Upload OpenVAS artifacts"
+        if: always() && env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-openvas-reports
+          path: reports/openvas/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Debug purpose - ToDo: Remove
+      - name: "Dump OpenVAS diagnostics"
+        if: always()
+        run: |
+          set -euo pipefail
+          docker ps -a || true
+          docker logs openvas > "${REPORTS_DIR}/openvas/openvas-container.log" 2>&1 || true
+          curl -fsSI http://127.0.0.1:8080 > "${REPORTS_DIR}/openvas/openvas-http-headers.txt" 2>&1 || true
