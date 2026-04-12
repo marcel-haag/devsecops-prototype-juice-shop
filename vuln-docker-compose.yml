@@ -1,0 +1,30 @@
+# Includes HIGH & LOW Issues
+version: "2.1"
+
+networks:
+  vuln-network:
+    driver: bridge
+
+services:
+  mongodb:
+    container_name: "vuln-network_mongodb"
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    networks:
+      - vuln-network
+
+  wiremock:
+    container_name: "vuln-network_wiremock"
+    image: rodolpheche/wiremock:2.23.2
+    ports:
+      - "8181:8080"
+    volumes:
+      - ./src/test/resources/mocks/:/home/wiremock
+    command:
+      - -verbose
+      - -global-response-templating
+    networks:
+      - vuln-network
