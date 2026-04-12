@@ -19,7 +19,7 @@ concurrency:
 env:
   REPORTS_DIR: reports
   UPLOAD_ARTIFACTS: "true"
-  TARGET_URL: "https://preview.owasp-juice.shop"
+  TARGET_HOST: "preview.owasp-juice"
 
 jobs:
   infra-scanning-openvas:
@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "target=${{ inputs.target_host || env.TARGET_URL }}"
+            echo "target=${{ inputs.target_host || env.TARGET_HOST }}"
             echo "trigger=${GITHUB_EVENT_NAME}"
             echo "repository=${GITHUB_REPOSITORY}"
             echo "ref=${GITHUB_REF}"
@@ -118,7 +118,7 @@ jobs:
           OPENVAS_PASSWORD: admin
           OPENVAS_HOST: 127.0.0.1
           OPENVAS_PORT: "9390"
-          TARGET_HOST: ${{ inputs.target_host || env.TARGET_URL }}
+          TARGET_HOST: ${{ inputs.target_host || env.TARGET_HOST }}
         run: |
           set -euo pipefail
 
