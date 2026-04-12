@@ -354,6 +354,7 @@ jobs:
             --scan /src/frontend/package-lock.json \
             --format "HTML" \
             --format "JSON" \
+            --format "XML" \
             --format "SARIF" \
             --out /report \
             --nvdApiKey "${NVD_API_KEY}" \
@@ -380,8 +381,8 @@ jobs:
 
       - name: "Fail on report generation problems"
         run: |
-          test -f "${REPORTS_DIR}/dependency-check/dependency-check-report.json" || {
-            echo "Dependency-Check report was not generated."
+          test -f "${REPORTS_DIR}/dependency-check/dependency-check-report.xml" || {
+            echo "Dependency-Check XML report was not generated."
             exit 1
           }
 
@@ -506,6 +507,13 @@ jobs:
             --misconfig-scanners dockerfile \
             --format table \
             --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.txt" \
+            Dockerfile || true
+
+          trivy config \
+            --misconfig-scanners dockerfile \
+            --format template \
+            --template "@contrib/junit.tpl" \
+            --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.xml" \
             Dockerfile || true
 
           echo "${JSON_EXIT_CODE}" > "${REPORTS_DIR}/trivy-iac/trivy-iac-exit-code.txt"
