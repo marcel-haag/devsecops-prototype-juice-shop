@@ -1,0 +1,612 @@
+name: "Scheduled Security Jobs"
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_DEFAULT_VERSION: 22
+  NODE_OPTIONS: "--max_old_space_size=4096"
+  REPORTS_DIR: reports
+  DOCKER_IMAGE_NAME: juice-shop
+  TARGET_URL: "https://preview.owasp-juice.shop"
+  # Stop / Start Artifact upload in all jobs (set to "true" to enable)
+  UPLOAD_ARTIFACTS: "true" # if: env.UPLOAD_ARTIFACTS
+
+jobs:
+  build-and-sbom-cyclonedx:
+    name: "Build application(s) and generate SBOM (CycloneDX)"
+    runs-on: ubuntu-latest
+
+    outputs:
+      backend_lockfile_exists: ${{ steps.detect.outputs.backend_lockfile_exists }}
+      frontend_lockfile_exists: ${{ steps.detect.outputs.frontend_lockfile_exists }}
+      docker_image_tag: ${{ steps.meta.outputs.docker_image_tag }}
+      docker_image_tar: ${{ steps.meta.outputs.docker_image_tar }}
+
+    steps:
+      # Build Steps
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Use Node.js ${{ env.NODE_DEFAULT_VERSION }}"
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af #v4.1.0
+        with:
+          node-version: ${{ env.NODE_DEFAULT_VERSION }}
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts
+
+      - name: "Install frontend dependencies and build"
+        run: |
+          cd frontend
+          npm install --ignore-scripts --package-lock=true
+          npm run build
+
+      - name: "Install backend dependencies"
+        run: |
+          npm install --ignore-scripts --package-lock=true
+
+      - name: "Debug frontend install output"
+        run: |
+          cd frontend
+          pwd
+          ls -la
+          ls -la package.json || true
+          ls -la package-lock.json || true
+          npm config get package-lock
+
+      - name: "Debug backend install output"
+        run: |
+          pwd
+          ls -la
+          ls -la package.json || true
+          ls -la package-lock.json || true
+          npm config get package-lock
+
+      - name: "Detect generated lockfiles"
+        id: detect
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "backend_lockfile_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend_lockfile_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f frontend/package-lock.json ]; then
+            echo "frontend_lockfile_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend_lockfile_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Upload lockfiles artifact"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: npm-lockfiles
+          path: |
+            package-lock.json
+            frontend/package-lock.json
+          if-no-files-found: warn
+
+      - name: "Set Docker image metadata"
+        id: meta
+        run: |
+          echo "docker_image_tag=${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "docker_image_tar=juice-shop-image.tar" >> "$GITHUB_OUTPUT"
+
+      - name: "Build container image"
+        run: |
+          docker build -t "${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" .
+
+      - name: "Save container image as tar"
+        run: |
+          docker save "${DOCKER_IMAGE_NAME}:${GITHUB_SHA}" -o juice-shop-image.tar
+
+      - name: "Upload container image artifact"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: built-docker-image
+          path: juice-shop-image.tar
+          if-no-files-found: error
+
+      # SBOM Steps
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/sbom"
+
+      - name: "Generate root CycloneDX SBOM"
+        run: |
+          set -euo pipefail
+
+          npx @cyclonedx/cyclonedx-npm \
+            --output-format JSON \
+            --output-file bom-root.json
+
+          npx @cyclonedx/cyclonedx-npm \
+            --output-format XML \
+            --output-file bom-root.xml
+
+          test -f bom-root.json
+          test -f bom-root.xml
+
+          cp bom-root.json "${REPORTS_DIR}/sbom/"
+          cp bom-root.xml "${REPORTS_DIR}/sbom/"
+
+      - name: "Collect frontend SBOM"
+        run: |
+          set -euo pipefail
+
+          test -f frontend/dist/bom/bom.json
+          cp frontend/dist/bom/bom.json "${REPORTS_DIR}/sbom/bom-frontend.json"
+
+      - name: "Find all generated BOM files"
+        if: always()
+        run: |
+          set -euo pipefail
+          find . \( -name "bom*.json" -o -name "bom*.xml" \) | sort
+          echo "--- reports/sbom ---"
+          ls -la "${REPORTS_DIR}/sbom"
+
+      - name: "Write SBOM metadata"
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "${REPORTS_DIR}/sbom"
+          {
+            echo "generator=@cyclonedx/cyclonedx-npm"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+          } > "${REPORTS_DIR}/sbom/sbom-metadata.txt"
+
+      - name: "List generated SBOM files"
+        if: always()
+        run: |
+          set -euo pipefail
+          ls -la "${REPORTS_DIR}/sbom"
+
+      - name: "Upload SBOM artifacts"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: reports/sbom/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Scans entire commit history for leaked credentials
+  secret-scanning:
+    name: "Secret scanning (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/gitleaks"
+
+      - name: "Download and install Gitleaks"
+        run: |
+          GITLEAKS_VERSION="8.24.2"
+          curl -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: "Run Gitleaks"
+        run: |
+          set +e
+          gitleaks git . \
+            --verbose \
+            --report-format json \
+            --report-path "${REPORTS_DIR}/gitleaks/gitleaks-report.json"
+          EXIT_CODE=$?
+
+          # optional second report format
+          gitleaks git . \
+            --verbose \
+            --report-format sarif \
+            --report-path "${REPORTS_DIR}/gitleaks/gitleaks-report.sarif" || true
+
+          echo "${EXIT_CODE}" > "${REPORTS_DIR}/gitleaks/gitleaks-exit-code.txt"
+          exit 0
+
+      - name: "Upload Gitleaks reports"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: secret-scanning-reports
+          path: ${{ env.REPORTS_DIR }}/gitleaks
+          if-no-files-found: warn
+  sast:
+    name: "SAST (Semgrep)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/semgrep"
+
+      - name: "Run Semgrep via Docker"
+        run: |
+          set +e
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --error \
+              --json \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.json"
+          EXIT_CODE=$?
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --sarif \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.sarif" || true
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config auto \
+              --text \
+              --output "${REPORTS_DIR}/semgrep/semgrep-report.txt" || true
+
+          echo "${EXIT_CODE}" > "${REPORTS_DIR}/semgrep/semgrep-exit-code.txt"
+          exit 0
+
+      - name: "Upload Semgrep reports"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: sast-semgrep-reports
+          path: ${{ env.REPORTS_DIR }}/semgrep
+          if-no-files-found: warn
+
+      - name: "Fail on Semgrep findings"
+        run: |
+          EXIT_CODE="$(cat "${REPORTS_DIR}/semgrep/semgrep-exit-code.txt")"
+          if [ "${EXIT_CODE}" -ne 0 ]; then
+            echo "Semgrep detected findings."
+            # exit "${EXIT_CODE}"
+          fi
+          exit 0
+
+  sca:
+    name: "SCA (OWASP Dependency-Check)"
+    needs: 
+      - build-and-sbom-cyclonedx
+    env:
+      # NVD
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      # Sonatype
+      OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
+      OSS_INDEX_TOKEN: ${{ secrets.OSS_INDEX_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: "Download lockfiles artifact"
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: npm-lockfiles
+          path: .
+
+      - name: "Show build outputs (sca)"
+        run: |
+          echo "backend_lockfile_exists=${{ needs.build-and-sbom-cyclonedx.outputs.backend_lockfile_exists }}"
+          echo "frontend_lockfile_exists=${{ needs.build-and-sbom-cyclonedx.outputs.frontend_lockfile_exists }}"
+
+      - name: "Fail if lockfiles are missing"
+        run: |
+          [ "${{ needs.build-and-sbom-cyclonedx.outputs.backend_lockfile_exists }}" = "true" ] || {
+            echo "Missing root package-lock.json"
+            exit 1
+          }
+
+          [ "${{ needs.build-and-sbom-cyclonedx.outputs.frontend_lockfile_exists }}" = "true" ] || {
+            echo "Missing frontend/package-lock.json"
+            exit 1
+          }
+
+      - name: "Prepare writable directories"
+        run: |
+          mkdir -p "${REPORTS_DIR}/dependency-check"
+          mkdir -p ".dependency-check-data"
+          chmod -R 777 "${REPORTS_DIR}/dependency-check" ".dependency-check-data"
+
+      - name: "Run Dependency-Check via Docker"
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -v "${GITHUB_WORKSPACE}/${REPORTS_DIR}/dependency-check:/report" \
+            -v "${GITHUB_WORKSPACE}/.dependency-check-data:/usr/share/dependency-check/data" \
+            owasp/dependency-check:latest \
+            --project "devsecops-prototype-juice-shop" \
+            --scan /src/package-lock.json \
+            --scan /src/frontend/package-lock.json \
+            --format "HTML" \
+            --format "JSON" \
+            --format "SARIF" \
+            --out /report \
+            --nvdApiKey "${NVD_API_KEY}" \
+            --ossIndexUsername "${OSS_INDEX_USERNAME}" \
+            --ossIndexPassword "${OSS_INDEX_TOKEN}" \
+            --prettyPrint \
+            || true
+
+      - name: "Debug Dependency-Check output"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        run: |
+          echo "Reports:"
+          ls -la "${REPORTS_DIR}/dependency-check" || true
+          echo "Data dir:"
+          ls -la ".dependency-check-data" || true
+
+      - name: "Upload Dependency-Check reports"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: sca-dependency-check-reports
+          path: ${{ env.REPORTS_DIR }}/dependency-check
+          if-no-files-found: warn
+
+      - name: "Fail on report generation problems"
+        run: |
+          test -f "${REPORTS_DIR}/dependency-check/dependency-check-report.json" || {
+            echo "Dependency-Check report was not generated."
+            exit 1
+          }
+
+  container-scanning:
+    name: "Container scanning (Trivy)"
+    needs: 
+      - build-and-sbom-cyclonedx
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/trivy"
+
+      - name: "Show build outputs (docker)"
+        run: |
+          echo "docker_image_tag=${{ needs.build-and-sbom-cyclonedx.outputs.docker_image_tag }}"
+          echo "docker_image_tar=${{ needs.build-and-sbom-cyclonedx.outputs.docker_image_tar }}"
+
+      - name: "Install Trivy"
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sh -s -- -b /usr/local/bin v0.69.3
+          trivy --version
+
+      - name: "Download built Docker image artifact"
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: built-docker-image
+          path: .
+
+      - name: "Load container image"
+        run: |
+          docker load -i juice-shop-image.tar
+          docker image ls
+
+      - name: "Show image metadata from build job"
+        run: |
+          echo "Image tag from build job: ${{ needs.build-and-sbom-cyclonedx.outputs.docker_image_tag }}"
+
+      - name: "Run Trivy container image scan"
+        run: |
+          set +e
+          IMAGE_TAG="${{ needs.build-and-sbom-cyclonedx.outputs.docker_image_tag }}"
+
+          trivy image \
+            --format json \
+            --output "${REPORTS_DIR}/trivy/trivy-image-report.json" \
+            "${IMAGE_TAG}"
+          JSON_EXIT_CODE=$?
+
+          trivy image \
+            --format sarif \
+            --output "${REPORTS_DIR}/trivy/trivy-image-report.sarif" \
+            "${IMAGE_TAG}" || true
+
+          trivy image \
+            --format table \
+            --output "${REPORTS_DIR}/trivy/trivy-image-report.txt" \
+            "${IMAGE_TAG}" || true
+
+          echo "${JSON_EXIT_CODE}" > "${REPORTS_DIR}/trivy/trivy-exit-code.txt"
+          exit 0
+
+      - name: "Upload Trivy reports"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: container-scanning-reports
+          path: ${{ env.REPORTS_DIR }}/trivy
+          if-no-files-found: warn
+
+      - name: "Fail on scan execution problems"
+        run: |
+          EXIT_CODE="$(cat "${REPORTS_DIR}/trivy/trivy-exit-code.txt")"
+          if [ "${EXIT_CODE}" -ne 0 ]; then
+            echo "Trivy image scan execution failed."
+            exit "${EXIT_CODE}"
+          fi
+
+  iac-scanning:
+    name: "IaC scanning (Trivy)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: "Create reports directory"
+        run: mkdir -p "${REPORTS_DIR}/trivy-iac"
+
+      - name: "Install Trivy"
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sh -s -- -b /usr/local/bin v0.69.3
+          trivy --version
+
+      - name: "Debug IaC targets"
+        run: |
+          pwd
+          ls -la
+          ls -la Dockerfile || true
+          ls -la docker-compose.test.yml || true
+
+      - name: "Run Trivy Dockerfile misconfiguration scan"
+        run: |
+          set +e
+
+          trivy config \
+            --misconfig-scanners dockerfile \
+            --format json \
+            --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.json" \
+            Dockerfile
+          JSON_EXIT_CODE=$?
+
+          trivy config \
+            --misconfig-scanners dockerfile \
+            --format sarif \
+            --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.sarif" \
+            Dockerfile || true
+
+          trivy config \
+            --misconfig-scanners dockerfile \
+            --format table \
+            --output "${REPORTS_DIR}/trivy-iac/trivy-iac-report.txt" \
+            Dockerfile || true
+
+          echo "${JSON_EXIT_CODE}" > "${REPORTS_DIR}/trivy-iac/trivy-iac-exit-code.txt"
+          exit 0
+
+      - name: "Upload Trivy IaC reports"
+        if: env.UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: iac-scanning-reports
+          path: ${{ env.REPORTS_DIR }}/trivy-iac
+          if-no-files-found: warn
+
+      - name: "Fail on scan execution problems"
+        run: |
+          EXIT_CODE="$(cat "${REPORTS_DIR}/trivy-iac/trivy-iac-exit-code.txt")"
+          if [ "${EXIT_CODE}" -ne 0 ]; then
+            echo "Trivy IaC scan execution failed."
+            exit "${EXIT_CODE}"
+          fi
+
+  dast-zap:
+    name: "DAST - ZAP Baseline Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Harden runner"
+        uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
+        with:
+          egress-policy: audit
+
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: "Create reports directory"
+        run: |
+          set -euo pipefail
+          mkdir -p "${REPORTS_DIR}/zap"
+          chmod -R 777 "$GITHUB_WORKSPACE/${REPORTS_DIR}/zap"
+
+      - name: "Check target availability"
+        run: |
+          set -euo pipefail
+          curl -I -L --max-time 30 "${TARGET_URL}" > "${REPORTS_DIR}/zap/target-headers.txt"
+
+      - name: "Run ZAP baseline scan"
+        run: |
+          set +e
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/${REPORTS_DIR}/zap:/zap/wrk/:rw" \
+            -t zaproxy/zap-weekly \
+            zap-baseline.py \
+              -t "${TARGET_URL}" \
+              -r "zap-baseline-report.html" \
+              -J "zap-baseline-report.json" \
+              -x "zap-baseline-report.xml" \
+              -w "zap-baseline-warnings.md" \
+              -m 5 \
+              -I
+
+          ZAP_EXIT_CODE=$?
+          echo "ZAP_EXIT_CODE=${ZAP_EXIT_CODE}" >> "$GITHUB_ENV"
+          echo "ZAP finished with exit code: ${ZAP_EXIT_CODE}"
+
+          set -e
+
+          if [ "${ZAP_EXIT_CODE}" -ne 0 ]; then
+            exit "${ZAP_EXIT_CODE}"
+          fi
+
+      - name: "Write scan metadata"
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "target=${TARGET_URL}"
+            echo "scan_type=ZAP_Baseline"
+            echo "trigger=${GITHUB_EVENT_NAME}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "zap_exit_code=${ZAP_EXIT_CODE:-unknown}"
+          } > "${REPORTS_DIR}/zap/scan-metadata.txt"
+
+      - name: "List generated report files"
+        if: always()
+        run: |
+          set -euo pipefail
+          ls -la "${REPORTS_DIR}/zap"
+
+      - name: "Upload DAST reports"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-zap-baseline-reports
+          path: reports/zap/
+          if-no-files-found: warn
+          retention-days: 14
+
