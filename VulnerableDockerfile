@@ -1,0 +1,15 @@
+# Includes LOW issues
+
+# Use an official MongoDB as the base image
+FROM mongo:5.0.0-focal
+
+# Set environment variables for MongoDB
+ENV MONGO_INITDB_ROOT_USERNAME=root
+ENV MONGO_INITDB_ROOT_PASSWORD=root
+ENV MONGO_INITDB_DATABASE=adminpw
+
+# Expose MongoDB default port
+EXPOSE 27020
+
+# Start MongoDB server
+CMD ["mongod"]
